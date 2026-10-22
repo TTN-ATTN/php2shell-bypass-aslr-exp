@@ -9,3 +9,7 @@ src/php-8.4.26/
 # Runtime output of the exploit (proof file / derived libphp offsets)
 out/*
 !out/.gitkeep
+
+# Per-version Docker lab runtime output.
+docker/php-*/out/*
+!docker/php-*/out/.gitkeep
